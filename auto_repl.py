@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -19,16 +19,8 @@ DEFAULT_JSON_DIR = Path("/tmp")
 MAP_FILE_RE = re.compile(r"^auto-repl-(\d{14})\.json$")
 
 
-@dataclass(frozen=True, slots=True)
-class MatchCandidate:
-    start: int
-    end: int
-    matched_text: str
-    pattern_index: int
-
-    @property
-    def length(self) -> int:
-        return self.end - self.start
+Candidate = tuple[int, int, int]  # (start, end, pattern_index)
+META_CHARS = frozenset(".^$*+?{}[]\\|()")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -56,6 +48,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--keep-json",
         type=int,
         help="In reverse mode, keep only X most recent map files in active JSON dir.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Forward mode only: number of worker processes (default: 1).",
     )
     return parser.parse_args(argv)
 
@@ -89,6 +87,16 @@ def load_patterns_from_strings(lines: Iterable[str]) -> tuple[list[str], list[re
     return raw_patterns, compiled
 
 
+def build_literal_hints(patterns: list[str]) -> list[str | None]:
+    hints: list[str | None] = []
+    for pattern in patterns:
+        if any(char in META_CHARS for char in pattern):
+            hints.append(None)
+            continue
+        hints.append(pattern.lower())
+    return hints
+
+
 def load_patterns(pattern_path: Path) -> tuple[list[str], list[re.Pattern[str]], list[Path]]:
     pattern_files = discover_regular_files(pattern_path)
     all_lines: list[str] = []
@@ -101,56 +109,59 @@ def load_patterns(pattern_path: Path) -> tuple[list[str], list[re.Pattern[str]],
     return raw_patterns, compiled, pattern_files
 
 
-def collect_match_candidates(text: str, patterns: list[re.Pattern[str]]) -> list[MatchCandidate]:
-    candidates: list[MatchCandidate] = []
+def collect_match_candidates(
+    text: str,
+    patterns: list[re.Pattern[str]],
+    literal_hints: list[str | None] | None = None,
+) -> list[Candidate]:
+    candidates: list[Candidate] = []
     append = candidates.append
+    text_lower = text.lower() if literal_hints else None
     for pattern_index, pattern in enumerate(patterns):
+        if literal_hints:
+            hint = literal_hints[pattern_index]
+            if hint and hint not in text_lower:
+                continue
         for match in pattern.finditer(text):
             if match.start() == match.end():
                 continue
-            append(
-                MatchCandidate(
-                    start=match.start(),
-                    end=match.end(),
-                    matched_text=match.group(0),
-                    pattern_index=pattern_index,
-                )
-            )
+            append((match.start(), match.end(), pattern_index))
     return candidates
 
 
-def overlaps(a: MatchCandidate, b: MatchCandidate) -> bool:
-    return not (a.end <= b.start or a.start >= b.end)
+def overlaps(a: Candidate, b: Candidate) -> bool:
+    return not (a[1] <= b[0] or a[0] >= b[1])
 
 
-def _select_non_overlapping_matches_legacy(candidates: list[MatchCandidate]) -> list[MatchCandidate]:
+def _select_non_overlapping_matches_legacy(candidates: list[Candidate]) -> list[Candidate]:
     """Reference implementation kept for equivalence tests."""
-    by_priority = sorted(candidates, key=lambda c: (-c.length, c.pattern_index, c.start))
-    selected: list[MatchCandidate] = []
+    by_priority = sorted(candidates, key=lambda c: (-(c[1] - c[0]), c[2], c[0]))
+    selected: list[Candidate] = []
     for candidate in by_priority:
         if any(overlaps(candidate, already) for already in selected):
             continue
         selected.append(candidate)
-    return sorted(selected, key=lambda c: c.start)
+    return sorted(selected, key=lambda c: c[0])
 
 
-def select_non_overlapping_matches(candidates: list[MatchCandidate]) -> list[MatchCandidate]:
+def select_non_overlapping_matches(candidates: list[Candidate]) -> list[Candidate]:
     """Choose non-overlapping matches with 'longest wins, tie by pattern order'."""
-    by_priority = sorted(candidates, key=lambda c: (-c.length, c.pattern_index, c.start))
+    by_priority = sorted(candidates, key=lambda c: (-(c[1] - c[0]), c[2], c[0]))
     selected_starts: list[int] = []
     selected_ends: list[int] = []
-    selected_items: list[MatchCandidate] = []
+    selected_items: list[Candidate] = []
 
     for candidate in by_priority:
-        idx = bisect.bisect_left(selected_starts, candidate.start)
+        start, end, _ = candidate
+        idx = bisect.bisect_left(selected_starts, start)
 
-        if idx > 0 and selected_ends[idx - 1] > candidate.start:
+        if idx > 0 and selected_ends[idx - 1] > start:
             continue
-        if idx < len(selected_starts) and selected_starts[idx] < candidate.end:
+        if idx < len(selected_starts) and selected_starts[idx] < end:
             continue
 
-        selected_starts.insert(idx, candidate.start)
-        selected_ends.insert(idx, candidate.end)
+        selected_starts.insert(idx, start)
+        selected_ends.insert(idx, end)
         selected_items.insert(idx, candidate)
 
     return selected_items
@@ -165,8 +176,9 @@ def forward_transform(
     text: str,
     patterns: list[re.Pattern[str]],
     raw_patterns: list[str],
+    literal_hints: list[str | None] | None = None,
 ) -> tuple[str, dict[str, str], list[dict[str, object]]]:
-    candidates = collect_match_candidates(text, patterns)
+    candidates = collect_match_candidates(text, patterns, literal_hints=literal_hints)
     selected = select_non_overlapping_matches(candidates)
 
     token_to_original: dict[str, str] = {}
@@ -175,27 +187,28 @@ def forward_transform(
     transformed_parts: list[str] = []
     cursor = 0
 
-    for match in selected:
-        transformed_parts.append(text[cursor : match.start])
-        key = (match.pattern_index, match.matched_text)
+    for start, end, pattern_index in selected:
+        matched_text = text[start:end]
+        transformed_parts.append(text[cursor:start])
+        key = (pattern_index, matched_text)
         token = key_to_token.get(key)
         if token is None:
-            token = generate_token(match.pattern_index, match.matched_text)
+            token = generate_token(pattern_index, matched_text)
             prior = token_to_original.get(token)
-            if prior is not None and prior != match.matched_text:
+            if prior is not None and prior != matched_text:
                 raise RuntimeError(
-                    f"Token collision for {token}: {prior!r} vs {match.matched_text!r}"
+                    f"Token collision for {token}: {prior!r} vs {matched_text!r}"
                 )
             key_to_token[key] = token
-            token_to_original[token] = match.matched_text
+            token_to_original[token] = matched_text
             token_metadata[token] = {
                 "token": token,
-                "original": match.matched_text,
-                "pattern_index": match.pattern_index,
-                "pattern": raw_patterns[match.pattern_index],
+                "original": matched_text,
+                "pattern_index": pattern_index,
+                "pattern": raw_patterns[pattern_index],
             }
         transformed_parts.append(token)
-        cursor = match.end
+        cursor = end
 
     transformed_parts.append(text[cursor:])
     mappings = sorted(token_metadata.values(), key=lambda item: str(item["token"]))
@@ -333,11 +346,51 @@ def token_map_from_payload(payload: dict[str, object]) -> dict[str, str]:
     return reconstructed
 
 
+def _process_forward_files(
+    file_paths: list[str],
+    output_suffix: str | None,
+    raw_patterns: list[str],
+    literal_hints: list[str | None],
+) -> dict[str, object]:
+    compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in raw_patterns]
+    token_to_original: dict[str, str] = {}
+    mappings_by_token: dict[str, dict[str, object]] = {}
+    processed_files: list[dict[str, str]] = []
+
+    for file_path in file_paths:
+        input_file = Path(file_path)
+        text = input_file.read_text(encoding="utf-8")
+        transformed, file_token_map, file_mappings = forward_transform(
+            text,
+            compiled_patterns,
+            raw_patterns,
+            literal_hints=literal_hints,
+        )
+        output_file = write_output(input_file, output_suffix, transformed)
+        processed_files.append({"input": str(input_file.resolve()), "output": str(output_file.resolve())})
+
+        for token, original in file_token_map.items():
+            existing = token_to_original.get(token)
+            if existing is not None and existing != original:
+                raise RuntimeError(f"Token collision across files for {token}: {existing!r} vs {original!r}")
+            token_to_original[token] = original
+        for item in file_mappings:
+            mappings_by_token[str(item["token"])] = item
+
+    return {
+        "processed_files": processed_files,
+        "token_to_original": token_to_original,
+        "mappings": mappings_by_token,
+    }
+
+
 def run_forward(args: argparse.Namespace) -> int:
     if not args.patterns:
         raise ValueError("--patterns is required in forward mode")
     if args.output is not None and not args.output:
         raise ValueError("--output suffix cannot be empty")
+    if args.jobs < 1:
+        raise ValueError("--jobs must be >= 1")
 
     input_root = Path(args.input)
     output_suffix = args.output
@@ -346,27 +399,62 @@ def run_forward(args: argparse.Namespace) -> int:
 
     input_files = discover_regular_files(input_root)
     raw_patterns, compiled_patterns, pattern_files = load_patterns(pattern_root)
+    literal_hints = build_literal_hints(raw_patterns)
     all_token_to_original: dict[str, str] = {}
     all_mappings: dict[str, dict[str, object]] = {}
     processed_files: list[dict[str, str]] = []
 
-    for input_file in input_files:
-        text = input_file.read_text(encoding="utf-8")
-        transformed, token_to_original, mappings = forward_transform(text, compiled_patterns, raw_patterns)
-        output_file = write_output(input_file, output_suffix, transformed)
-        processed_files.append(
-            {
-                "input": str(input_file.resolve()),
-                "output": str(output_file.resolve()),
-            }
-        )
-        for token, original in token_to_original.items():
-            existing = all_token_to_original.get(token)
-            if existing is not None and existing != original:
-                raise RuntimeError(f"Token collision across files for {token}: {existing!r} vs {original!r}")
-            all_token_to_original[token] = original
-        for item in mappings:
-            all_mappings[str(item["token"])] = item
+    if args.jobs == 1 or len(input_files) <= 1:
+        for input_file in input_files:
+            text = input_file.read_text(encoding="utf-8")
+            transformed, token_to_original, mappings = forward_transform(
+                text,
+                compiled_patterns,
+                raw_patterns,
+                literal_hints=literal_hints,
+            )
+            output_file = write_output(input_file, output_suffix, transformed)
+            processed_files.append({"input": str(input_file.resolve()), "output": str(output_file.resolve())})
+            for token, original in token_to_original.items():
+                existing = all_token_to_original.get(token)
+                if existing is not None and existing != original:
+                    raise RuntimeError(f"Token collision across files for {token}: {existing!r} vs {original!r}")
+                all_token_to_original[token] = original
+            for item in mappings:
+                all_mappings[str(item["token"])] = item
+    else:
+        jobs = min(args.jobs, len(input_files))
+        chunks: list[list[str]] = [[] for _ in range(jobs)]
+        for idx, input_file in enumerate(input_files):
+            chunks[idx % jobs].append(str(input_file))
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as executor:
+            futures = [
+                executor.submit(
+                    _process_forward_files,
+                    chunk,
+                    output_suffix,
+                    raw_patterns,
+                    literal_hints,
+                )
+                for chunk in chunks
+                if chunk
+            ]
+            worker_results = [future.result() for future in futures]
+
+        for result in worker_results:
+            processed_files.extend(result["processed_files"])
+            token_to_original = result["token_to_original"]
+            mappings = result["mappings"]
+            for token, original in token_to_original.items():
+                existing = all_token_to_original.get(token)
+                if existing is not None and existing != original:
+                    raise RuntimeError(f"Token collision across files for {token}: {existing!r} vs {original!r}")
+                all_token_to_original[token] = original
+            for token, item in mappings.items():
+                all_mappings[token] = item
+
+        processed_files.sort(key=lambda item: item["input"])
 
     ts = timestamp_now()
     json_dir.mkdir(parents=True, exist_ok=True)
@@ -393,6 +481,8 @@ def run_reverse(args: argparse.Namespace) -> int:
         raise ValueError("--keep-json must be >= 0")
     if args.output is not None and not args.output:
         raise ValueError("--output suffix cannot be empty")
+    if args.jobs != 1:
+        raise ValueError("--jobs is only supported in forward mode")
 
     input_root = Path(args.input)
     output_suffix = args.output

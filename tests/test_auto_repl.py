@@ -65,8 +65,8 @@ class AutoReplTests(unittest.TestCase):
         candidates = auto_repl.collect_match_candidates(text, patterns)
         selected = auto_repl.select_non_overlapping_matches(candidates)
         self.assertEqual(len(selected), 1)
-        self.assertEqual(selected[0].matched_text, "abc")
-        self.assertEqual(selected[0].pattern_index, 1)
+        self.assertEqual(text[selected[0][0] : selected[0][1]], "abc")
+        self.assertEqual(selected[0][2], 1)
 
     def test_selected_matches_never_overlap(self) -> None:
         text = "ababa"
@@ -78,44 +78,50 @@ class AutoReplTests(unittest.TestCase):
             for j in range(i + 1, len(selected)):
                 self.assertFalse(auto_repl.overlaps(selected[i], selected[j]))
 
-        spans = [(item.start, item.end) for item in selected]
+        spans = [(item[0], item[1]) for item in selected]
         self.assertEqual(spans, [(0, 3), (3, 5)])
 
     def test_selection_equivalence_randomized_against_legacy(self) -> None:
         rng = random.Random(1337)
         for _ in range(200):
             candidate_count = rng.randint(8, 50)
-            candidates: list[auto_repl.MatchCandidate] = []
+            candidates: list[auto_repl.Candidate] = []
             for _ in range(candidate_count):
                 start = rng.randint(0, 80)
                 length = rng.randint(1, 12)
                 end = start + length
                 pattern_index = rng.randint(0, 7)
-                matched_text = "x" * length
-                candidates.append(
-                    auto_repl.MatchCandidate(
-                        start=start,
-                        end=end,
-                        matched_text=matched_text,
-                        pattern_index=pattern_index,
-                    )
-                )
+                candidates.append((start, end, pattern_index))
 
             optimized = auto_repl.select_non_overlapping_matches(candidates)
             legacy = auto_repl._select_non_overlapping_matches_legacy(candidates)
-            optimized_view = [(c.start, c.end, c.pattern_index) for c in optimized]
-            legacy_view = [(c.start, c.end, c.pattern_index) for c in legacy]
+            optimized_view = [(c[0], c[1], c[2]) for c in optimized]
+            legacy_view = [(c[0], c[1], c[2]) for c in legacy]
             self.assertEqual(optimized_view, legacy_view)
 
     def test_selection_tie_same_start_same_length_pattern_order(self) -> None:
         candidates = [
-            auto_repl.MatchCandidate(start=2, end=6, matched_text="AAAA", pattern_index=3),
-            auto_repl.MatchCandidate(start=2, end=6, matched_text="BBBB", pattern_index=1),
-            auto_repl.MatchCandidate(start=6, end=9, matched_text="CCC", pattern_index=2),
+            (2, 6, 3),
+            (2, 6, 1),
+            (6, 9, 2),
         ]
         selected = auto_repl.select_non_overlapping_matches(candidates)
-        view = [(c.start, c.end, c.pattern_index) for c in selected]
+        view = [(c[0], c[1], c[2]) for c in selected]
         self.assertEqual(view, [(2, 6, 1), (6, 9, 2)])
+
+    def test_literal_hint_prefilter_presence_and_absence(self) -> None:
+        patterns_raw, patterns = auto_repl.load_patterns_from_strings(["literal", "te.st"])
+        hints = auto_repl.build_literal_hints(patterns_raw)
+        self.assertEqual(hints[0], "literal")
+        self.assertIsNone(hints[1])
+
+        with_hint = auto_repl.collect_match_candidates("xxLITERALyy teXst", patterns, hints)
+        without_hint = auto_repl.collect_match_candidates("xxLITERALyy teXst", patterns)
+        self.assertEqual(with_hint, without_hint)
+
+        no_literal_with_hint = auto_repl.collect_match_candidates("abc def", patterns, hints)
+        no_literal_no_hint = auto_repl.collect_match_candidates("abc def", patterns)
+        self.assertEqual(no_literal_with_hint, no_literal_no_hint)
 
     def test_token_is_deterministic_and_valid_shape(self) -> None:
         token_a = auto_repl.generate_token(0, "TeSt123")
@@ -217,6 +223,8 @@ class AutoReplTests(unittest.TestCase):
                     "_modified",
                     "--json-dir",
                     str(json_dir),
+                    "--jobs",
+                    "1",
                 ]
             )
             self.assertEqual(rc, 0)
@@ -251,6 +259,90 @@ class AutoReplTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(one_modified.read_text(encoding="utf-8"), "test TEST")
             self.assertEqual(two_modified.read_text(encoding="utf-8"), "test42")
+
+    def test_forward_jobs_equivalence_single_vs_multi(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            (inputs / "a.txt").write_text("test TEST test42", encoding="utf-8")
+            (inputs / "b.txt").write_text("test43 alpha TEST", encoding="utf-8")
+            patterns = root / "patterns.txt"
+            patterns.write_text("test\ntest[0-9]+\nalpha\n", encoding="utf-8")
+
+            seq_in = root / "seq"
+            par_in = root / "par"
+            seq_in.mkdir()
+            par_in.mkdir()
+            for p in inputs.rglob("*.txt"):
+                rel = p.relative_to(inputs)
+                target_a = seq_in / rel
+                target_a.parent.mkdir(parents=True, exist_ok=True)
+                target_a.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+                target_b = par_in / rel
+                target_b.parent.mkdir(parents=True, exist_ok=True)
+                target_b.write_text(p.read_text(encoding="utf-8"), encoding="utf-8")
+
+            seq_maps = root / "maps_seq"
+            par_maps = root / "maps_par"
+
+            rc = auto_repl.main(
+                [
+                    "--mode",
+                    "forward",
+                    "--input",
+                    str(seq_in),
+                    "--patterns",
+                    str(patterns),
+                    "--json-dir",
+                    str(seq_maps),
+                    "--jobs",
+                    "1",
+                ]
+            )
+            self.assertEqual(rc, 0)
+
+            rc = auto_repl.main(
+                [
+                    "--mode",
+                    "forward",
+                    "--input",
+                    str(par_in),
+                    "--patterns",
+                    str(patterns),
+                    "--json-dir",
+                    str(par_maps),
+                    "--jobs",
+                    "2",
+                ]
+            )
+            self.assertEqual(rc, 0)
+
+            for p in seq_in.rglob("*.txt"):
+                rel = p.relative_to(seq_in)
+                self.assertEqual(p.read_text(encoding="utf-8"), (par_in / rel).read_text(encoding="utf-8"))
+
+            seq_payload = json.loads(next(seq_maps.glob("auto-repl-*.json")).read_text(encoding="utf-8"))
+            par_payload = json.loads(next(par_maps.glob("auto-repl-*.json")).read_text(encoding="utf-8"))
+            self.assertEqual(seq_payload["token_to_original"], par_payload["token_to_original"])
+            seq_rel = sorted(
+                (
+                    str(Path(item["input"]).relative_to(seq_in)),
+                    str(Path(item["output"]).relative_to(seq_in)),
+                )
+                for item in seq_payload["processed_files"]
+            )
+            par_rel = sorted(
+                (
+                    str(Path(item["input"]).relative_to(par_in)),
+                    str(Path(item["output"]).relative_to(par_in)),
+                )
+                for item in par_payload["processed_files"]
+            )
+            self.assertEqual(
+                seq_rel,
+                par_rel,
+            )
 
     def test_reverse_keep_json_uses_map_file_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
