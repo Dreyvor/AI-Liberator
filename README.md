@@ -10,7 +10,7 @@ This project replaces matched text with deterministic IDs and can restore origin
   - Read regex patterns from a file or a directory (recursive).
   - Process input from a file or a directory (recursive).
   - Replace matches with deterministic IDs (`a` + SHA-256 hex, lowercase alnum, no hyphen).
-  - Save one mapping JSON per run: `auto-repl-YYYYMMDDHHMMSS.json`.
+  - Save one mapping JSON per run: `ai-liberator-map-YYYYMMDDHHMMSS.json`.
 - Reverse mode:
   - Restore IDs to original text using a mapping JSON.
   - Auto-pick latest mapping from `--json-dir` (fallback to `/tmp`) when `--map-file` is omitted.
@@ -110,7 +110,7 @@ Use explicit map file:
 python3 ai_liberator.py \
   --mode reverse \
   --input ./data \
-  --map-file /tmp/auto-repl-20260415123456.json
+  --map-file /tmp/ai-liberator-map-20260415123456.json
 ```
 
 Keep only the newest N mapping files after reverse:
@@ -161,7 +161,7 @@ usr_[a-z]{4,10}[0-9]{1,4}
 Each forward run writes one JSON file:
 
 ```text
-<json-dir>/auto-repl-YYYYMMDDHHMMSS.json
+<json-dir>/ai-liberator-map-YYYYMMDDHHMMSS.json
 ```
 
 It includes:
@@ -198,4 +198,4 @@ Useful knobs:
 
 ## License
 
-Add your license here (for example, MIT).
+GPL-3.0. See [LICENSE](LICENSE).

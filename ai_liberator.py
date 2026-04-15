@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 DEFAULT_JSON_DIR = Path("/tmp")
-MAP_FILE_RE = re.compile(r"^auto-repl-(\d{14})\.json$")
+MAP_FILE_RE = re.compile(r"^ai-liberator-map-(\d{14})\.json$")
 
 
 Candidate = tuple[int, int, int]  # (start, end, pattern_index)
@@ -305,7 +305,7 @@ def write_output(
 
 
 def map_filename_from_timestamp(ts: str) -> str:
-    return f"auto-repl-{ts}.json"
+    return f"ai-liberator-map-{ts}.json"
 
 
 def parse_map_timestamp(path: Path) -> str | None:

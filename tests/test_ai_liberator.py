@@ -149,21 +149,21 @@ class AutoReplTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as primary, tempfile.TemporaryDirectory() as fallback:
             primary_path = Path(primary)
             fallback_path = Path(fallback)
-            (fallback_path / "auto-repl-20250101000000.json").write_text("{}", encoding="utf-8")
-            (fallback_path / "auto-repl-20260101000000.json").write_text("{}", encoding="utf-8")
+            (fallback_path / "ai-liberator-map-20250101000000.json").write_text("{}", encoding="utf-8")
+            (fallback_path / "ai-liberator-map-20260101000000.json").write_text("{}", encoding="utf-8")
             latest, active = ai_liberator.find_latest_map_file(primary_path, fallback_path)
-            self.assertEqual(latest, fallback_path / "auto-repl-20260101000000.json")
+            self.assertEqual(latest, fallback_path / "ai-liberator-map-20260101000000.json")
             self.assertEqual(active, fallback_path)
 
     def test_prune_old_map_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
             for ts in ("20260101000000", "20260102000000", "20260103000000"):
-                (path / f"auto-repl-{ts}.json").write_text("{}", encoding="utf-8")
+                (path / f"ai-liberator-map-{ts}.json").write_text("{}", encoding="utf-8")
             deleted = ai_liberator.prune_old_map_files(path, 1)
             self.assertEqual(len(deleted), 2)
             remaining = sorted(p.name for p in ai_liberator.list_map_files(path))
-            self.assertEqual(remaining, ["auto-repl-20260103000000.json"])
+            self.assertEqual(remaining, ["ai-liberator-map-20260103000000.json"])
 
     def test_forward_reverse_roundtrip_single_file_inplace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -393,8 +393,8 @@ class AutoReplTests(unittest.TestCase):
                 rel = p.relative_to(seq_in)
                 self.assertEqual(p.read_text(encoding="utf-8"), (par_in / rel).read_text(encoding="utf-8"))
 
-            seq_payload = json.loads(next(seq_maps.glob("auto-repl-*.json")).read_text(encoding="utf-8"))
-            par_payload = json.loads(next(par_maps.glob("auto-repl-*.json")).read_text(encoding="utf-8"))
+            seq_payload = json.loads(next(seq_maps.glob("ai-liberator-map-*.json")).read_text(encoding="utf-8"))
+            par_payload = json.loads(next(par_maps.glob("ai-liberator-map-*.json")).read_text(encoding="utf-8"))
             self.assertEqual(seq_payload["token_to_original"], par_payload["token_to_original"])
             seq_rel = sorted(
                 (
@@ -425,7 +425,7 @@ class AutoReplTests(unittest.TestCase):
 
             for ts in ("20260101000000", "20260102000000", "20260103000000"):
                 payload = {"token_to_original": {"atoken": "value"}}
-                (json_dir / f"auto-repl-{ts}.json").write_text(json.dumps(payload), encoding="utf-8")
+                (json_dir / f"ai-liberator-map-{ts}.json").write_text(json.dumps(payload), encoding="utf-8")
 
             rc = ai_liberator.main(
                 [
@@ -434,7 +434,7 @@ class AutoReplTests(unittest.TestCase):
                     "--input",
                     str(input_path),
                     "--map-file",
-                    str(json_dir / "auto-repl-20260102000000.json"),
+                    str(json_dir / "ai-liberator-map-20260102000000.json"),
                     "--keep-json",
                     "1",
                 ]
@@ -452,8 +452,8 @@ class AutoReplTests(unittest.TestCase):
             input_path.write_text("atoken", encoding="utf-8")
 
             payload = {"token_to_original": {"atoken": "from_json_dir"}}
-            (json_dir / "auto-repl-20270101000000.json").write_text(json.dumps(payload), encoding="utf-8")
-            (Path(fallback) / "auto-repl-20280101000000.json").write_text(
+            (json_dir / "ai-liberator-map-20270101000000.json").write_text(json.dumps(payload), encoding="utf-8")
+            (Path(fallback) / "ai-liberator-map-20280101000000.json").write_text(
                 json.dumps({"token_to_original": {"atoken": "from_tmp"}}),
                 encoding="utf-8",
             )
