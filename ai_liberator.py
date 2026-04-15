@@ -25,13 +25,15 @@ META_CHARS = frozenset(".^$*+?{}[]\\|()")
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Regex/token bidirectional replacer")
-    parser.add_argument("--mode", choices=("forward", "reverse"), required=True)
-    parser.add_argument("--input", required=True, help="Input file or directory")
+    parser.add_argument("-m", "--mode", choices=("forward", "reverse"), required=True)
+    parser.add_argument("-i", "--input", required=True, help="Input file or directory")
     parser.add_argument(
+        "-o",
         "--output",
         help="Output suffix (ex: _modified). If omitted, perform in-place atomic replacement.",
     )
     parser.add_argument(
+        "-p",
         "--patterns",
         help="Regex patterns file or directory (one pattern per line). Required in forward mode.",
     )
@@ -50,10 +52,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="In reverse mode, keep only X most recent map files in active JSON dir.",
     )
     parser.add_argument(
+        "-j"
         "--jobs",
         type=int,
-        default=1,
-        help="Forward mode only: number of worker processes (default: 1).",
+        default=4,
+        help="Forward mode only: number of worker processes (default: 4).",
     )
     return parser.parse_args(argv)
 
