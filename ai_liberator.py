@@ -38,6 +38,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Regex patterns file or directory (one pattern per line). Required in forward mode.",
     )
     parser.add_argument(
+        "-O",
+        "--output-dir",
+        help="Optional output directory. If set, write outputs there (preserving relative tree for directory input).",
+    )
+    parser.add_argument(
+        "-d",
         "--json-dir",
         default=str(DEFAULT_JSON_DIR),
         help="Directory for correspondence JSON files (default: /tmp).",
@@ -52,11 +58,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="In reverse mode, keep only X most recent map files in active JSON dir.",
     )
     parser.add_argument(
-        "-j"
+        "-j",
         "--jobs",
         type=int,
-        default=4,
-        help="Forward mode only: number of worker processes (default: 4).",
+        default=1,
+        help="Forward mode only: number of worker processes (default: 1).",
     )
     return parser.parse_args(argv)
 
@@ -248,8 +254,13 @@ def write_text_atomically(path: Path, content: str) -> None:
     os.replace(temp_name, path)
 
 
-def build_output_path(input_path: Path, output_suffix: str | None) -> Path:
-    if not output_suffix:
+def build_output_path(
+    input_path: Path,
+    output_suffix: str | None,
+    output_dir: Path | None = None,
+    input_root: Path | None = None,
+) -> Path:
+    if output_dir is None and not output_suffix:
         return input_path
 
     suffixes = input_path.suffixes
@@ -258,11 +269,33 @@ def build_output_path(input_path: Path, output_suffix: str | None) -> Path:
         base = input_path.name[: -len(extension)]
     else:
         base = input_path.name
-    return input_path.with_name(f"{base}{output_suffix}{extension}")
+    output_name = f"{base}{output_suffix}{extension}" if output_suffix else input_path.name
+
+    if output_dir is None:
+        return input_path.with_name(output_name)
+
+    if input_root is not None:
+        try:
+            rel_parent = input_path.relative_to(input_root).parent
+        except ValueError:
+            rel_parent = Path()
+        return output_dir / rel_parent / output_name
+    return output_dir / output_name
 
 
-def write_output(input_path: Path, output_suffix: str | None, content: str) -> Path:
-    target = build_output_path(input_path, output_suffix)
+def write_output(
+    input_path: Path,
+    output_suffix: str | None,
+    content: str,
+    output_dir: Path | None = None,
+    input_root: Path | None = None,
+) -> Path:
+    target = build_output_path(
+        input_path,
+        output_suffix,
+        output_dir=output_dir,
+        input_root=input_root,
+    )
     if target.resolve() == input_path.resolve():
         write_text_atomically(target, content)
         return target
@@ -352,6 +385,8 @@ def token_map_from_payload(payload: dict[str, object]) -> dict[str, str]:
 def _process_forward_files(
     file_paths: list[str],
     output_suffix: str | None,
+    output_dir: str | None,
+    input_root: str,
     raw_patterns: list[str],
     literal_hints: list[str | None],
 ) -> dict[str, object]:
@@ -359,6 +394,8 @@ def _process_forward_files(
     token_to_original: dict[str, str] = {}
     mappings_by_token: dict[str, dict[str, object]] = {}
     processed_files: list[dict[str, str]] = []
+    output_dir_path = Path(output_dir) if output_dir else None
+    input_root_path = Path(input_root)
 
     for file_path in file_paths:
         input_file = Path(file_path)
@@ -369,7 +406,13 @@ def _process_forward_files(
             raw_patterns,
             literal_hints=literal_hints,
         )
-        output_file = write_output(input_file, output_suffix, transformed)
+        output_file = write_output(
+            input_file,
+            output_suffix,
+            transformed,
+            output_dir=output_dir_path,
+            input_root=input_root_path,
+        )
         processed_files.append({"input": str(input_file.resolve()), "output": str(output_file.resolve())})
 
         for token, original in file_token_map.items():
@@ -397,8 +440,11 @@ def run_forward(args: argparse.Namespace) -> int:
 
     input_root = Path(args.input)
     output_suffix = args.output
+    output_dir = Path(args.output_dir) if args.output_dir else None
     pattern_root = Path(args.patterns)
     json_dir = Path(args.json_dir)
+    if args.output_dir is not None and not args.output_dir:
+        raise ValueError("--output-dir cannot be empty")
 
     input_files = discover_regular_files(input_root)
     raw_patterns, compiled_patterns, pattern_files = load_patterns(pattern_root)
@@ -416,7 +462,13 @@ def run_forward(args: argparse.Namespace) -> int:
                 raw_patterns,
                 literal_hints=literal_hints,
             )
-            output_file = write_output(input_file, output_suffix, transformed)
+            output_file = write_output(
+                input_file,
+                output_suffix,
+                transformed,
+                output_dir=output_dir,
+                input_root=input_root,
+            )
             processed_files.append({"input": str(input_file.resolve()), "output": str(output_file.resolve())})
             for token, original in token_to_original.items():
                 existing = all_token_to_original.get(token)
@@ -437,6 +489,8 @@ def run_forward(args: argparse.Namespace) -> int:
                     _process_forward_files,
                     chunk,
                     output_suffix,
+                    str(output_dir) if output_dir else None,
+                    str(input_root),
                     raw_patterns,
                     literal_hints,
                 )
@@ -489,8 +543,11 @@ def run_reverse(args: argparse.Namespace) -> int:
 
     input_root = Path(args.input)
     output_suffix = args.output
+    output_dir = Path(args.output_dir) if args.output_dir else None
     primary_json_dir = Path(args.json_dir)
     input_files = discover_regular_files(input_root)
+    if args.output_dir is not None and not args.output_dir:
+        raise ValueError("--output-dir cannot be empty")
 
     if args.map_file:
         map_path = Path(args.map_file)
@@ -508,7 +565,13 @@ def run_reverse(args: argparse.Namespace) -> int:
     for input_file in input_files:
         text = input_file.read_text(encoding="utf-8")
         restored = reverse_transform(text, token_to_original)
-        write_output(input_file, output_suffix, restored)
+        write_output(
+            input_file,
+            output_suffix,
+            restored,
+            output_dir=output_dir,
+            input_root=input_root,
+        )
 
     if args.keep_json is not None:
         prune_old_map_files(active_json_dir, args.keep_json)

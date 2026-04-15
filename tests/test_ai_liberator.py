@@ -47,6 +47,20 @@ class AutoReplTests(unittest.TestCase):
             Path("/tmp/README_modified"),
         )
 
+    def test_build_output_path_with_output_dir_preserves_relative_structure(self) -> None:
+        input_root = Path("/tmp/source")
+        input_path = input_root / "nested" / "file.txt"
+        output_dir = Path("/tmp/output")
+        self.assertEqual(
+            ai_liberator.build_output_path(
+                input_path,
+                "_modified",
+                output_dir=output_dir,
+                input_root=input_root,
+            ),
+            Path("/tmp/output/nested/file_modified.txt"),
+        )
+
     def test_pattern_directory_aggregation_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -259,6 +273,63 @@ class AutoReplTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(one_modified.read_text(encoding="utf-8"), "test TEST")
             self.assertEqual(two_modified.read_text(encoding="utf-8"), "test42")
+
+    def test_forward_and_reverse_with_output_dir_creates_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "inputs"
+            input_dir.mkdir()
+            (input_dir / "one.txt").write_text("test TEST", encoding="utf-8")
+            (input_dir / "nested").mkdir()
+            (input_dir / "nested" / "two.txt").write_text("test42", encoding="utf-8")
+
+            patterns = root / "patterns.txt"
+            patterns.write_text("test\ntest[0-9]+\n", encoding="utf-8")
+            json_dir = root / "maps"
+            output_dir = root / "out" / "generated"
+
+            rc = ai_liberator.main(
+                [
+                    "--mode",
+                    "forward",
+                    "--input",
+                    str(input_dir),
+                    "--patterns",
+                    str(patterns),
+                    "--output-dir",
+                    str(output_dir),
+                    "-d",
+                    str(json_dir),
+                    "--jobs",
+                    "1",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertTrue(output_dir.exists())
+
+            out_one = output_dir / "one.txt"
+            out_two = output_dir / "nested" / "two.txt"
+            self.assertTrue(out_one.exists())
+            self.assertTrue(out_two.exists())
+            self.assertNotEqual(out_one.read_text(encoding="utf-8"), "test TEST")
+            self.assertNotEqual(out_two.read_text(encoding="utf-8"), "test42")
+
+            restored_dir = root / "restored"
+            rc = ai_liberator.main(
+                [
+                    "--mode",
+                    "reverse",
+                    "--input",
+                    str(output_dir),
+                    "--output-dir",
+                    str(restored_dir),
+                    "-d",
+                    str(json_dir),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual((restored_dir / "one.txt").read_text(encoding="utf-8"), "test TEST")
+            self.assertEqual((restored_dir / "nested" / "two.txt").read_text(encoding="utf-8"), "test42")
 
     def test_forward_jobs_equivalence_single_vs_multi(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

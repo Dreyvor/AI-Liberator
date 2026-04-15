@@ -17,6 +17,7 @@ This project replaces matched text with deterministic IDs and can restore origin
 - Output behavior:
   - In-place write by default.
   - Optional suffix output (`--output _modified`), e.g. `test.txt` -> `test_modified.txt`.
+  - Optional output directory (`--output-dir`), created automatically when missing.
 - Matching behavior:
   - Case-insensitive matching (`re.IGNORECASE`) for all patterns.
   - Overlap resolution: longest match wins, tie-break by pattern order, no overlapping replacements.
@@ -76,6 +77,7 @@ python3 ai_liberator.py \
   --input ./data \
   --patterns ./patterns \
   --output _modified \
+  --output-dir ./out \
   --json-dir /tmp
 ```
 
@@ -98,6 +100,7 @@ Auto-pick latest map from `--json-dir` (fallback `/tmp`):
 python3 ai_liberator.py \
   --mode reverse \
   --input ./data \
+  --output-dir ./restored \
   --json-dir /tmp
 ```
 
@@ -127,7 +130,8 @@ python3 ai_liberator.py \
 --input PATH               Required. File or directory.
 --patterns PATH            Required in forward mode. File or directory.
 --output SUFFIX            Optional output suffix; omitted means in-place.
---json-dir PATH            Mapping directory (default: /tmp).
+--output-dir PATH          Optional output directory; auto-created if missing.
+-d, --json-dir PATH        Mapping directory (default: /tmp).
 --map-file PATH            Explicit mapping file (reverse mode).
 --keep-json N              Keep only N newest mapping files (reverse mode).
 --jobs N                   Forward mode workers (default: 1).
