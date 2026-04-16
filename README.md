@@ -25,6 +25,8 @@ This project replaces matched text with deterministic IDs and can restore origin
   - Optimized overlap selection.
   - Optional pattern literal prefiltering.
   - Optional forward multiprocessing via `--jobs`.
+- File handling:
+  - Non-UTF-8 input files are skipped with a warning instead of failing the whole run.
 
 ## Requirements
 
@@ -135,6 +137,8 @@ python3 ai_liberator.py \
 --map-file PATH            Explicit mapping file (reverse mode).
 --keep-json N              Keep only N newest mapping files (reverse mode).
 --jobs N                   Forward mode workers (default: 1).
+--verbose                  Enable verbose logging (including skipped non-UTF-8 file notices).
+--debug                    Enable debug logging (includes verbose logging).
 ```
 
 ## Patterns format
@@ -168,6 +172,7 @@ It includes:
 
 - Run metadata (`timestamp`, `created_at`, input/pattern paths).
 - `processed_files` (input/output path pairs).
+- `skipped_files` (files not processed, e.g. non-UTF-8 content).
 - `token_to_original` dictionary.
 - `mappings` list (token, original, pattern index, pattern).
 

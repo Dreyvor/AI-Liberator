@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,9 @@ META_CHARS = frozenset(".^$*+?{}[]\\|()")
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Regex/token bidirectional replacer")
+    parser.add_argument("--codex-hook", action='store_true', help="Should be set if used as a Codex hook")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging output.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging output.")
     parser.add_argument("-m", "--mode", choices=("forward", "reverse"), required=True)
     parser.add_argument("-i", "--input", required=True, help="Input file or directory")
     parser.add_argument(
@@ -77,6 +81,15 @@ def discover_regular_files(path: Path) -> list[Path]:
 
     files = [item for item in path.rglob("*") if item.is_file()]
     return sorted(files, key=lambda item: str(item.relative_to(path)).lower())
+
+
+def read_utf8_text(path: Path, verbose: bool = False, debug: bool = False) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        if verbose or debug:
+            print(f"Skipping non-UTF-8 file: {path} ({exc})", file=sys.stderr)
+        return None
 
 
 def load_patterns_from_strings(lines: Iterable[str]) -> tuple[list[str], list[re.Pattern[str]]]:
@@ -389,17 +402,28 @@ def _process_forward_files(
     input_root: str,
     raw_patterns: list[str],
     literal_hints: list[str | None],
+    verbose: bool = False,
+    debug: bool = False,
 ) -> dict[str, object]:
     compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in raw_patterns]
     token_to_original: dict[str, str] = {}
     mappings_by_token: dict[str, dict[str, object]] = {}
     processed_files: list[dict[str, str]] = []
+    skipped_files: list[dict[str, str]] = []
     output_dir_path = Path(output_dir) if output_dir else None
     input_root_path = Path(input_root)
 
     for file_path in file_paths:
         input_file = Path(file_path)
-        text = input_file.read_text(encoding="utf-8")
+        text = read_utf8_text(input_file, verbose=verbose, debug=debug)
+        if text is None:
+            skipped_files.append(
+                {
+                    "path": str(input_file.resolve()),
+                    "reason": "non_utf8",
+                }
+            )
+            continue
         transformed, file_token_map, file_mappings = forward_transform(
             text,
             compiled_patterns,
@@ -425,6 +449,7 @@ def _process_forward_files(
 
     return {
         "processed_files": processed_files,
+        "skipped_files": skipped_files,
         "token_to_original": token_to_original,
         "mappings": mappings_by_token,
     }
@@ -452,10 +477,19 @@ def run_forward(args: argparse.Namespace) -> int:
     all_token_to_original: dict[str, str] = {}
     all_mappings: dict[str, dict[str, object]] = {}
     processed_files: list[dict[str, str]] = []
+    skipped_files: list[dict[str, str]] = []
 
     if args.jobs == 1 or len(input_files) <= 1:
         for input_file in input_files:
-            text = input_file.read_text(encoding="utf-8")
+            text = read_utf8_text(input_file, verbose=args.verbose, debug=args.debug)
+            if text is None:
+                skipped_files.append(
+                    {
+                        "path": str(input_file.resolve()),
+                        "reason": "non_utf8",
+                    }
+                )
+                continue
             transformed, token_to_original, mappings = forward_transform(
                 text,
                 compiled_patterns,
@@ -493,6 +527,8 @@ def run_forward(args: argparse.Namespace) -> int:
                     str(input_root),
                     raw_patterns,
                     literal_hints,
+                    args.verbose,
+                    args.debug,
                 )
                 for chunk in chunks
                 if chunk
@@ -501,6 +537,7 @@ def run_forward(args: argparse.Namespace) -> int:
 
         for result in worker_results:
             processed_files.extend(result["processed_files"])
+            skipped_files.extend(result["skipped_files"])
             token_to_original = result["token_to_original"]
             mappings = result["mappings"]
             for token, original in token_to_original.items():
@@ -513,6 +550,8 @@ def run_forward(args: argparse.Namespace) -> int:
 
         processed_files.sort(key=lambda item: item["input"])
 
+    skipped_files.sort(key=lambda item: item["path"])
+
     ts = timestamp_now()
     json_dir.mkdir(parents=True, exist_ok=True)
     map_path = json_dir / map_filename_from_timestamp(ts)
@@ -522,6 +561,7 @@ def run_forward(args: argparse.Namespace) -> int:
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "input_root": str(input_root.resolve()),
         "processed_files": processed_files,
+        "skipped_files": skipped_files,
         "patterns_path": str(pattern_root.resolve()),
         "patterns_files": [str(path.resolve()) for path in pattern_files],
         "id_strategy": "deterministic_sha256_prefixed",
@@ -530,6 +570,7 @@ def run_forward(args: argparse.Namespace) -> int:
         "mappings": sorted(all_mappings.values(), key=lambda item: str(item["token"])),
     }
     map_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
     return 0
 
 
@@ -563,7 +604,9 @@ def run_reverse(args: argparse.Namespace) -> int:
     payload = load_map_file(map_path)
     token_to_original = token_map_from_payload(payload)
     for input_file in input_files:
-        text = input_file.read_text(encoding="utf-8")
+        text = read_utf8_text(input_file, verbose=args.verbose, debug=args.debug)
+        if text is None:
+            continue
         restored = reverse_transform(text, token_to_original)
         write_output(
             input_file,
@@ -580,6 +623,10 @@ def run_reverse(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.codex_hook:
+        _ = json.loads(sys.stdin.read())
+
     if args.mode == "forward":
         return run_forward(args)
     return run_reverse(args)

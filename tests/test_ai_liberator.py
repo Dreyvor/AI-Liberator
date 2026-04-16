@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import io
 import random
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -144,6 +146,16 @@ class AutoReplTests(unittest.TestCase):
         self.assertTrue(token_a[0].isalpha())
         self.assertTrue(token_a.islower())
         self.assertTrue(token_a.isalnum())
+
+    def test_parse_args_verbose_and_debug_flags(self) -> None:
+        args = ai_liberator.parse_args(["--mode", "forward", "--input", "in.txt", "--patterns", "p.txt"])
+        self.assertFalse(args.verbose)
+        self.assertFalse(args.debug)
+        args = ai_liberator.parse_args(
+            ["--mode", "forward", "--input", "in.txt", "--patterns", "p.txt", "--verbose", "--debug"]
+        )
+        self.assertTrue(args.verbose)
+        self.assertTrue(args.debug)
 
     def test_find_latest_map_file_with_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as primary, tempfile.TemporaryDirectory() as fallback:
@@ -471,6 +483,91 @@ class AutoReplTests(unittest.TestCase):
                 )
             self.assertEqual(rc, 0)
             self.assertEqual(input_path.read_text(encoding="utf-8"), "from_json_dir")
+
+    def test_forward_skips_non_utf8_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "inputs"
+            input_dir.mkdir()
+            text_file = input_dir / "one.txt"
+            binary_file = input_dir / "blob.bin"
+            text_file.write_text("test TEST", encoding="utf-8")
+            original_binary = b"\xff\xfe\x80\x81test"
+            binary_file.write_bytes(original_binary)
+            patterns = root / "patterns.txt"
+            patterns.write_text("test\n", encoding="utf-8")
+            json_dir = root / "maps"
+
+            rc = ai_liberator.main(
+                [
+                    "--mode",
+                    "forward",
+                    "--input",
+                    str(input_dir),
+                    "--patterns",
+                    str(patterns),
+                    "--json-dir",
+                    str(json_dir),
+                    "--jobs",
+                    "1",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertNotEqual(text_file.read_text(encoding="utf-8"), "test TEST")
+            self.assertEqual(binary_file.read_bytes(), original_binary)
+
+            payload = json.loads(next(json_dir.glob("ai-liberator-map-*.json")).read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["processed_files"]), 1)
+            self.assertEqual(len(payload["skipped_files"]), 1)
+            self.assertTrue(payload["skipped_files"][0]["path"].endswith("blob.bin"))
+            self.assertEqual(payload["skipped_files"][0]["reason"], "non_utf8")
+
+    def test_reverse_skips_non_utf8_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "inputs"
+            input_dir.mkdir()
+            text_file = input_dir / "one.txt"
+            binary_file = input_dir / "blob.bin"
+            text_file.write_text("atoken", encoding="utf-8")
+            original_binary = b"\xff\xfe\x80\x81atoken"
+            binary_file.write_bytes(original_binary)
+
+            json_dir = root / "maps"
+            json_dir.mkdir()
+            map_path = json_dir / "ai-liberator-map-20260102030405.json"
+            map_path.write_text(json.dumps({"token_to_original": {"atoken": "value"}}), encoding="utf-8")
+
+            rc = ai_liberator.main(
+                [
+                    "--mode",
+                    "reverse",
+                    "--input",
+                    str(input_dir),
+                    "--json-dir",
+                    str(json_dir),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(text_file.read_text(encoding="utf-8"), "value")
+            self.assertEqual(binary_file.read_bytes(), original_binary)
+
+    def test_read_utf8_text_logging_requires_verbose_or_debug(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "blob.bin"
+            path.write_bytes(b"\xff\xfe\x80\x81")
+
+            silent_stderr = io.StringIO()
+            with redirect_stderr(silent_stderr):
+                text = ai_liberator.read_utf8_text(path)
+            self.assertIsNone(text)
+            self.assertEqual(silent_stderr.getvalue(), "")
+
+            verbose_stderr = io.StringIO()
+            with redirect_stderr(verbose_stderr):
+                text = ai_liberator.read_utf8_text(path, verbose=True)
+            self.assertIsNone(text)
+            self.assertIn("Skipping non-UTF-8 file:", verbose_stderr.getvalue())
 
 
 if __name__ == "__main__":
