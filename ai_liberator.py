@@ -68,6 +68,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
         help="Forward mode only: number of worker processes (default: 1).",
     )
+    parser.add_argument(
+        "--rename-paths",
+        action="store_true",
+        help="Also transform file and directory names (directories and file stems).",
+    )
     return parser.parse_args(argv)
 
 
@@ -246,6 +251,155 @@ def reverse_transform(text: str, token_to_original: dict[str, str]) -> str:
     return pattern.sub(lambda m: token_to_original[m.group(0)], text)
 
 
+def split_name_extension(name: str) -> tuple[str, str]:
+    suffixes = Path(name).suffixes
+    extension = "".join(suffixes)
+    if not extension:
+        return name, ""
+    return name[: -len(extension)], extension
+
+
+def apply_suffix_to_filename(name: str, output_suffix: str | None) -> str:
+    if not output_suffix:
+        return name
+    base, extension = split_name_extension(name)
+    return f"{base}{output_suffix}{extension}"
+
+
+def apply_output_suffix_to_relative_path(rel_path: Path, output_suffix: str | None) -> Path:
+    if not output_suffix:
+        return rel_path
+    return rel_path.with_name(apply_suffix_to_filename(rel_path.name, output_suffix))
+
+
+def relative_input_path(input_file: Path, input_root: Path) -> Path:
+    if input_root.is_file():
+        return Path(input_file.name)
+    return input_file.relative_to(input_root)
+
+
+def _merge_token_maps(base: dict[str, str], incoming: dict[str, str], context: str) -> None:
+    for token, original in incoming.items():
+        existing = base.get(token)
+        if existing is not None and existing != original:
+            raise RuntimeError(f"Token collision {context} for {token}: {existing!r} vs {original!r}")
+        base[token] = original
+
+
+def transform_relative_path_forward(
+    rel_path: Path,
+    patterns: list[re.Pattern[str]],
+    raw_patterns: list[str],
+    literal_hints: list[str | None] | None = None,
+) -> tuple[Path, dict[str, str], list[dict[str, object]]]:
+    transformed_parts: list[str] = []
+    token_to_original: dict[str, str] = {}
+    mappings_by_token: dict[str, dict[str, object]] = {}
+    last_index = len(rel_path.parts) - 1
+
+    for idx, part in enumerate(rel_path.parts):
+        if idx == last_index:
+            stem, extension = split_name_extension(part)
+            transformed_stem, part_tokens, part_mappings = forward_transform(
+                stem,
+                patterns,
+                raw_patterns,
+                literal_hints=literal_hints,
+            )
+            transformed_parts.append(f"{transformed_stem}{extension}")
+        else:
+            transformed_part, part_tokens, part_mappings = forward_transform(
+                part,
+                patterns,
+                raw_patterns,
+                literal_hints=literal_hints,
+            )
+            transformed_parts.append(transformed_part)
+
+        _merge_token_maps(token_to_original, part_tokens, context="in path segments")
+        for item in part_mappings:
+            mappings_by_token[str(item["token"])] = item
+
+    return Path(*transformed_parts), token_to_original, sorted(
+        mappings_by_token.values(),
+        key=lambda item: str(item["token"]),
+    )
+
+
+def transform_relative_path_reverse(
+    rel_path: Path,
+    token_to_original: dict[str, str],
+) -> Path:
+    restored_parts: list[str] = []
+    last_index = len(rel_path.parts) - 1
+    for idx, part in enumerate(rel_path.parts):
+        if idx == last_index:
+            stem, extension = split_name_extension(part)
+            restored_parts.append(f"{reverse_transform(stem, token_to_original)}{extension}")
+        else:
+            restored_parts.append(reverse_transform(part, token_to_original))
+    return Path(*restored_parts)
+
+
+def disambiguation_suffix(source_rel: Path) -> str:
+    digest = hashlib.sha256(str(source_rel.as_posix()).encode("utf-8")).hexdigest()[:8]
+    return f"__{digest}"
+
+
+def add_suffix_to_relative_filename(path: Path, extra: str) -> Path:
+    base, extension = split_name_extension(path.name)
+    return path.with_name(f"{base}{extra}{extension}")
+
+
+def resolve_relative_path_collisions(
+    items: list[dict[str, Path]],
+    desired_key: str,
+    source_key: str,
+) -> dict[str, Path]:
+    buckets: dict[str, list[dict[str, Path]]] = {}
+    for item in items:
+        desired = item[desired_key]
+        buckets.setdefault(desired.as_posix(), []).append(item)
+
+    used_targets: set[str] = set()
+    resolved: dict[str, Path] = {}
+    ordered_targets = sorted(buckets.keys())
+    for target_key in ordered_targets:
+        bucket = sorted(
+            buckets[target_key],
+            key=lambda item: item[source_key].as_posix(),
+        )
+        target = Path(target_key)
+        if len(bucket) == 1 and target.as_posix() not in used_targets:
+            source_rel = bucket[0][source_key]
+            resolved[source_rel.as_posix()] = target
+            used_targets.add(target.as_posix())
+            continue
+
+        for item in bucket:
+            source_rel = item[source_key]
+            suffix = disambiguation_suffix(source_rel)
+            candidate = add_suffix_to_relative_filename(target, suffix)
+            counter = 2
+            while candidate.as_posix() in used_targets:
+                candidate = add_suffix_to_relative_filename(target, f"{suffix}_{counter}")
+                counter += 1
+            resolved[source_rel.as_posix()] = candidate
+            used_targets.add(candidate.as_posix())
+    return resolved
+
+
+def remove_empty_directories(root: Path) -> None:
+    if not root.exists() or not root.is_dir():
+        return
+    directories = sorted((path for path in root.rglob("*") if path.is_dir()), key=lambda p: len(p.parts), reverse=True)
+    for directory in directories:
+        try:
+            directory.rmdir()
+        except OSError:
+            continue
+
+
 def timestamp_now() -> str:
     return datetime.now().strftime("%Y%m%d%H%M%S")
 
@@ -272,17 +426,20 @@ def build_output_path(
     output_suffix: str | None,
     output_dir: Path | None = None,
     input_root: Path | None = None,
+    output_relative_path: Path | None = None,
 ) -> Path:
+    if output_relative_path is not None:
+        if output_dir is not None:
+            return output_dir / output_relative_path
+        if input_root is None:
+            return input_path.with_name(output_relative_path.name)
+        if input_root.is_file():
+            return input_path.with_name(output_relative_path.name)
+        return input_root / output_relative_path
+
     if output_dir is None and not output_suffix:
         return input_path
-
-    suffixes = input_path.suffixes
-    extension = "".join(suffixes)
-    if extension:
-        base = input_path.name[: -len(extension)]
-    else:
-        base = input_path.name
-    output_name = f"{base}{output_suffix}{extension}" if output_suffix else input_path.name
+    output_name = apply_suffix_to_filename(input_path.name, output_suffix)
 
     if output_dir is None:
         return input_path.with_name(output_name)
@@ -302,18 +459,23 @@ def write_output(
     content: str,
     output_dir: Path | None = None,
     input_root: Path | None = None,
+    output_relative_path: Path | None = None,
+    remove_source: bool = False,
 ) -> Path:
     target = build_output_path(
         input_path,
         output_suffix,
         output_dir=output_dir,
         input_root=input_root,
+        output_relative_path=output_relative_path,
     )
     if target.resolve() == input_path.resolve():
         write_text_atomically(target, content)
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
+    if remove_source and input_path.exists():
+        input_path.unlink()
     return target
 
 
@@ -393,6 +555,30 @@ def token_map_from_payload(payload: dict[str, object]) -> dict[str, str]:
             continue
         reconstructed[str(token)] = str(original)
     return reconstructed
+
+
+def path_token_map_from_payload(payload: dict[str, object]) -> dict[str, str]:
+    token_to_original = payload.get("path_token_to_original")
+    if not isinstance(token_to_original, dict):
+        return {}
+    return {str(k): str(v) for k, v in token_to_original.items()}
+
+
+def reverse_path_lookup_from_payload(payload: dict[str, object]) -> dict[str, Path]:
+    processed_paths = payload.get("processed_paths")
+    if not isinstance(processed_paths, list):
+        return {}
+
+    lookup: dict[str, Path] = {}
+    for item in processed_paths:
+        if not isinstance(item, dict):
+            continue
+        input_rel = item.get("input_rel")
+        output_rel = item.get("output_rel")
+        if input_rel is None or output_rel is None:
+            continue
+        lookup[str(output_rel)] = Path(str(input_rel))
+    return lookup
 
 
 def _process_forward_files(
@@ -476,10 +662,14 @@ def run_forward(args: argparse.Namespace) -> int:
     literal_hints = build_literal_hints(raw_patterns)
     all_token_to_original: dict[str, str] = {}
     all_mappings: dict[str, dict[str, object]] = {}
+    path_token_to_original: dict[str, str] = {}
+    path_mappings_by_token: dict[str, dict[str, object]] = {}
     processed_files: list[dict[str, str]] = []
+    processed_paths: list[dict[str, str]] = []
     skipped_files: list[dict[str, str]] = []
+    rename_paths = bool(args.rename_paths)
 
-    if args.jobs == 1 or len(input_files) <= 1:
+    if not rename_paths and (args.jobs == 1 or len(input_files) <= 1):
         for input_file in input_files:
             text = read_utf8_text(input_file, verbose=args.verbose, debug=args.debug)
             if text is None:
@@ -504,6 +694,16 @@ def run_forward(args: argparse.Namespace) -> int:
                 input_root=input_root,
             )
             processed_files.append({"input": str(input_file.resolve()), "output": str(output_file.resolve())})
+            input_rel = relative_input_path(input_file, input_root)
+            output_rel = relative_input_path(output_file, output_dir if output_dir else input_root)
+            processed_paths.append(
+                {
+                    "input": str(input_file.resolve()),
+                    "output": str(output_file.resolve()),
+                    "input_rel": input_rel.as_posix(),
+                    "output_rel": output_rel.as_posix(),
+                }
+            )
             for token, original in token_to_original.items():
                 existing = all_token_to_original.get(token)
                 if existing is not None and existing != original:
@@ -511,7 +711,7 @@ def run_forward(args: argparse.Namespace) -> int:
                 all_token_to_original[token] = original
             for item in mappings:
                 all_mappings[str(item["token"])] = item
-    else:
+    elif not rename_paths:
         jobs = min(args.jobs, len(input_files))
         chunks: list[list[str]] = [[] for _ in range(jobs)]
         for idx, input_file in enumerate(input_files):
@@ -549,6 +749,107 @@ def run_forward(args: argparse.Namespace) -> int:
                 all_mappings[token] = item
 
         processed_files.sort(key=lambda item: item["input"])
+        processed_paths = [
+            {
+                "input": item["input"],
+                "output": item["output"],
+                "input_rel": relative_input_path(Path(item["input"]), input_root).as_posix(),
+                "output_rel": relative_input_path(
+                    Path(item["output"]),
+                    output_dir if output_dir else input_root,
+                ).as_posix(),
+            }
+            for item in processed_files
+        ]
+    else:
+        plan_items: list[dict[str, object]] = []
+        for input_file in input_files:
+            input_rel = relative_input_path(input_file, input_root)
+            renamed_rel, file_path_token_map, path_mappings = transform_relative_path_forward(
+                input_rel,
+                compiled_patterns,
+                raw_patterns,
+                literal_hints=literal_hints,
+            )
+            _merge_token_maps(path_token_to_original, file_path_token_map, context="across path renames")
+            for item in path_mappings:
+                path_mappings_by_token[str(item["token"])] = item
+
+            desired_output_rel = apply_output_suffix_to_relative_path(renamed_rel, output_suffix)
+            plan_items.append(
+                {
+                    "input_file": input_file,
+                    "input_rel": input_rel,
+                    "desired_output_rel": desired_output_rel,
+                }
+            )
+
+        resolved = resolve_relative_path_collisions(
+            plan_items,
+            desired_key="desired_output_rel",
+            source_key="input_rel",
+        )
+
+        in_place_rename = output_dir is None and output_suffix is None
+        prepared_contents: dict[str, str] = {}
+        for item in plan_items:
+            input_file = item["input_file"]
+            text = read_utf8_text(input_file, verbose=args.verbose, debug=args.debug)
+            if text is None:
+                skipped_files.append(
+                    {
+                        "path": str(input_file.resolve()),
+                        "reason": "non_utf8",
+                    }
+                )
+                continue
+            transformed, token_to_original, mappings = forward_transform(
+                text,
+                compiled_patterns,
+                raw_patterns,
+                literal_hints=literal_hints,
+            )
+            prepared_contents[str(input_file.resolve())] = transformed
+            for token, original in token_to_original.items():
+                existing = all_token_to_original.get(token)
+                if existing is not None and existing != original:
+                    raise RuntimeError(f"Token collision across files for {token}: {existing!r} vs {original!r}")
+                all_token_to_original[token] = original
+            for mapping in mappings:
+                all_mappings[str(mapping["token"])] = mapping
+
+        for item in plan_items:
+            input_file = item["input_file"]
+            input_rel = item["input_rel"]
+            input_key = str(input_file.resolve())
+            content = prepared_contents.get(input_key)
+            if content is None:
+                continue
+            resolved_rel = resolved[input_rel.as_posix()]
+            output_file = write_output(
+                input_file,
+                output_suffix=None,
+                content=content,
+                output_dir=output_dir,
+                input_root=input_root,
+                output_relative_path=resolved_rel,
+                remove_source=in_place_rename,
+            )
+            processed_files.append({"input": str(input_file.resolve()), "output": str(output_file.resolve())})
+            processed_paths.append(
+                {
+                    "input": str(input_file.resolve()),
+                    "output": str(output_file.resolve()),
+                    "input_rel": input_rel.as_posix(),
+                    "output_rel": resolved_rel.as_posix(),
+                }
+            )
+
+        if in_place_rename:
+            remove_empty_directories(input_root)
+
+        processed_files.sort(key=lambda item: item["input"])
+        processed_paths.sort(key=lambda item: item["input"])
 
     skipped_files.sort(key=lambda item: item["path"])
 
@@ -567,7 +868,10 @@ def run_forward(args: argparse.Namespace) -> int:
         "id_strategy": "deterministic_sha256_prefixed",
         "case_insensitive": True,
         "token_to_original": all_token_to_original,
+        "path_token_to_original": path_token_to_original,
         "mappings": sorted(all_mappings.values(), key=lambda item: str(item["token"])),
+        "path_mappings": sorted(path_mappings_by_token.values(), key=lambda item: str(item["token"])),
+        "processed_paths": processed_paths,
     }
     map_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
@@ -603,18 +907,66 @@ def run_reverse(args: argparse.Namespace) -> int:
 
     payload = load_map_file(map_path)
     token_to_original = token_map_from_payload(payload)
+    path_token_to_original = path_token_map_from_payload(payload)
+    reverse_path_lookup = reverse_path_lookup_from_payload(payload)
+    rename_paths = bool(args.rename_paths)
+
+    plan_items: list[dict[str, object]] = []
     for input_file in input_files:
+        input_rel = relative_input_path(input_file, input_root)
+        if rename_paths:
+            output_rel_base = reverse_path_lookup.get(input_rel.as_posix())
+            if output_rel_base is None:
+                output_rel_base = transform_relative_path_reverse(input_rel, path_token_to_original)
+        else:
+            output_rel_base = input_rel
+        desired_output_rel = apply_output_suffix_to_relative_path(output_rel_base, output_suffix)
+        plan_items.append(
+            {
+                "input_file": input_file,
+                "input_rel": input_rel,
+                "desired_output_rel": desired_output_rel,
+            }
+        )
+
+    if rename_paths:
+        resolved = resolve_relative_path_collisions(
+            plan_items,
+            desired_key="desired_output_rel",
+            source_key="input_rel",
+        )
+    else:
+        resolved = {item["input_rel"].as_posix(): item["desired_output_rel"] for item in plan_items}
+
+    in_place_rename = rename_paths and output_dir is None and output_suffix is None
+    prepared_contents: dict[str, str] = {}
+    for item in plan_items:
+        input_file = item["input_file"]
         text = read_utf8_text(input_file, verbose=args.verbose, debug=args.debug)
         if text is None:
             continue
-        restored = reverse_transform(text, token_to_original)
+        prepared_contents[str(input_file.resolve())] = reverse_transform(text, token_to_original)
+
+    for item in plan_items:
+        input_file = item["input_file"]
+        input_key = str(input_file.resolve())
+        restored = prepared_contents.get(input_key)
+        if restored is None:
+            continue
+        input_rel = item["input_rel"]
+        output_rel = resolved[input_rel.as_posix()]
         write_output(
             input_file,
-            output_suffix,
-            restored,
+            output_suffix=None,
+            content=restored,
             output_dir=output_dir,
             input_root=input_root,
+            output_relative_path=output_rel,
+            remove_source=in_place_rename,
         )
+
+    if in_place_rename:
+        remove_empty_directories(input_root)
 
     if args.keep_json is not None:
         prune_old_map_files(active_json_dir, args.keep_json)

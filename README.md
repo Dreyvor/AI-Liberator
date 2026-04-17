@@ -18,6 +18,7 @@ This project replaces matched text with deterministic IDs and can restore origin
   - In-place write by default.
   - Optional suffix output (`--output _modified`), e.g. `test.txt` -> `test_modified.txt`.
   - Optional output directory (`--output-dir`), created automatically when missing.
+  - Optional path renaming (`--rename-paths`) for directory names and file stems (extensions preserved).
 - Matching behavior:
   - Case-insensitive matching (`re.IGNORECASE`) for all patterns.
   - Overlap resolution: longest match wins, tie-break by pattern order, no overlapping replacements.
@@ -137,6 +138,7 @@ python3 ai_liberator.py \
 --map-file PATH            Explicit mapping file (reverse mode).
 --keep-json N              Keep only N newest mapping files (reverse mode).
 --jobs N                   Forward mode workers (default: 1).
+--rename-paths             Also transform directory names and file stems.
 --verbose                  Enable verbose logging (including skipped non-UTF-8 file notices).
 --debug                    Enable debug logging (includes verbose logging).
 ```
@@ -172,8 +174,10 @@ It includes:
 
 - Run metadata (`timestamp`, `created_at`, input/pattern paths).
 - `processed_files` (input/output path pairs).
+- `processed_paths` (input/output pairs including relative paths for path renaming restore).
 - `skipped_files` (files not processed, e.g. non-UTF-8 content).
 - `token_to_original` dictionary.
+- `path_token_to_original` dictionary (tokens created while transforming names).
 - `mappings` list (token, original, pattern index, pattern).
 
 ## Behavior details

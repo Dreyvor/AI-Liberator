@@ -63,6 +63,63 @@ class AutoReplTests(unittest.TestCase):
             Path("/tmp/output/nested/file_modified.txt"),
         )
 
+    def test_build_output_path_with_explicit_relative_path(self) -> None:
+        input_root = Path("/tmp/source")
+        input_path = input_root / "nested" / "file.txt"
+        output_dir = Path("/tmp/output")
+        self.assertEqual(
+            ai_liberator.build_output_path(
+                input_path,
+                "_ignored",
+                output_dir=output_dir,
+                input_root=input_root,
+                output_relative_path=Path("renamed/path.txt"),
+            ),
+            Path("/tmp/output/renamed/path.txt"),
+        )
+
+    def test_transform_relative_path_forward_preserves_extensions(self) -> None:
+        raw_patterns, patterns = ai_liberator.load_patterns_from_strings(["alpha", "beta"])
+        hints = ai_liberator.build_literal_hints(raw_patterns)
+        transformed, token_map, _ = ai_liberator.transform_relative_path_forward(
+            Path("alpha_dir/file_beta.tar.gz"),
+            patterns,
+            raw_patterns,
+            literal_hints=hints,
+        )
+        self.assertNotEqual(transformed.as_posix(), "alpha_dir/file_beta.tar.gz")
+        self.assertTrue(transformed.name.endswith(".tar.gz"))
+        self.assertTrue(token_map)
+
+    def test_resolve_relative_path_collisions_is_deterministic(self) -> None:
+        items = [
+            {
+                "input_rel": Path("a/source.txt"),
+                "desired_output_rel": Path("target/file.txt"),
+            },
+            {
+                "input_rel": Path("b/source.txt"),
+                "desired_output_rel": Path("target/file.txt"),
+            },
+        ]
+        first = ai_liberator.resolve_relative_path_collisions(
+            items,
+            desired_key="desired_output_rel",
+            source_key="input_rel",
+        )
+        second = ai_liberator.resolve_relative_path_collisions(
+            items,
+            desired_key="desired_output_rel",
+            source_key="input_rel",
+        )
+        self.assertEqual(first, second)
+        self.assertNotEqual(
+            first["a/source.txt"].as_posix(),
+            first["b/source.txt"].as_posix(),
+        )
+        self.assertTrue(first["a/source.txt"].name.endswith(".txt"))
+        self.assertTrue(first["b/source.txt"].name.endswith(".txt"))
+
     def test_pattern_directory_aggregation_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -151,11 +208,17 @@ class AutoReplTests(unittest.TestCase):
         args = ai_liberator.parse_args(["--mode", "forward", "--input", "in.txt", "--patterns", "p.txt"])
         self.assertFalse(args.verbose)
         self.assertFalse(args.debug)
+        self.assertFalse(args.rename_paths)
         args = ai_liberator.parse_args(
             ["--mode", "forward", "--input", "in.txt", "--patterns", "p.txt", "--verbose", "--debug"]
         )
         self.assertTrue(args.verbose)
         self.assertTrue(args.debug)
+        self.assertFalse(args.rename_paths)
+        args = ai_liberator.parse_args(
+            ["--mode", "reverse", "--input", "in.txt", "--rename-paths"]
+        )
+        self.assertTrue(args.rename_paths)
 
     def test_find_latest_map_file_with_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as primary, tempfile.TemporaryDirectory() as fallback:
@@ -426,6 +489,68 @@ class AutoReplTests(unittest.TestCase):
                 seq_rel,
                 par_rel,
             )
+
+    def test_forward_reverse_with_rename_paths_renames_and_restores_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_dir = root / "inputs"
+            nested = input_dir / "project_alpha"
+            nested.mkdir(parents=True)
+            original_rel = Path("project_alpha/file_test.tar.gz")
+            original_path = input_dir / original_rel
+            original_content = "alpha test TEST"
+            original_path.write_text(original_content, encoding="utf-8")
+
+            patterns = root / "patterns.txt"
+            patterns.write_text("alpha\ntest\nproject\nfile\n", encoding="utf-8")
+            json_dir = root / "maps"
+
+            rc = ai_liberator.main(
+                [
+                    "--mode",
+                    "forward",
+                    "--input",
+                    str(input_dir),
+                    "--patterns",
+                    str(patterns),
+                    "--json-dir",
+                    str(json_dir),
+                    "--rename-paths",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            map_path = next(json_dir.glob("ai-liberator-map-*.json"))
+            payload = json.loads(map_path.read_text(encoding="utf-8"))
+
+            self.assertIn("processed_paths", payload)
+            self.assertIn("path_token_to_original", payload)
+            self.assertTrue(payload["path_token_to_original"])
+            self.assertEqual(len(payload["processed_paths"]), 1)
+            processed = payload["processed_paths"][0]
+            self.assertEqual(processed["input_rel"], original_rel.as_posix())
+            self.assertNotEqual(processed["output_rel"], original_rel.as_posix())
+            self.assertTrue(processed["output_rel"].endswith(".tar.gz"))
+
+            renamed_path = input_dir / processed["output_rel"]
+            self.assertTrue(renamed_path.exists())
+            self.assertFalse(original_path.exists())
+            self.assertNotEqual(renamed_path.read_text(encoding="utf-8"), original_content)
+
+            rc = ai_liberator.main(
+                [
+                    "--mode",
+                    "reverse",
+                    "--input",
+                    str(input_dir),
+                    "--json-dir",
+                    str(json_dir),
+                    "--rename-paths",
+                ]
+            )
+            self.assertEqual(rc, 0)
+            self.assertTrue(original_path.exists())
+            self.assertFalse(renamed_path.exists())
+            self.assertEqual(original_path.read_text(encoding="utf-8"), original_content)
 
     def test_reverse_keep_json_uses_map_file_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
